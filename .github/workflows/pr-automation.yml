@@ -1,0 +1,772 @@
+name: Pull Request Automation
+
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+env:
+  NODE_VERSION: '20'
+
+jobs:
+  code-quality:
+    name: code-quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Identify changed files for formatting checks
+        id: prettier_targets
+        run: |
+          set -euo pipefail
+          git diff --name-only "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}" > changed-files.txt
+          grep -E '\.(js|cjs|mjs|json|md|ya?ml)$' changed-files.txt > prettier-targets.txt || true
+
+          if [ -s prettier-targets.txt ]; then
+            echo "has_targets=true" >> "$GITHUB_OUTPUT"
+            echo "Files queued for Prettier checks:"
+            cat prettier-targets.txt
+          else
+            echo "has_targets=false" >> "$GITHUB_OUTPUT"
+            echo "No changed files require Prettier checks." > prettier-report.txt
+          fi
+
+      - name: Run ESLint
+        id: eslint_check
+        continue-on-error: true
+        run: |
+          set +e
+          npm run lint > eslint-report.txt 2>&1
+          eslint_exit_code=$?
+          echo "exit_code=$eslint_exit_code" >> "$GITHUB_OUTPUT"
+          if [ ! -s eslint-report.txt ]; then
+            echo "ESLint completed without console output." > eslint-report.txt
+          fi
+          echo "ESLint exit code: $eslint_exit_code"
+          exit 0
+
+      - name: Run Prettier checks
+        id: prettier_check
+        if: steps.prettier_targets.outputs.has_targets == 'true'
+        continue-on-error: true
+        run: |
+          set +e
+          xargs -r npx prettier --check < prettier-targets.txt > prettier-report.txt 2>&1
+          prettier_exit_code=$?
+          echo "exit_code=$prettier_exit_code" >> "$GITHUB_OUTPUT"
+          if [ ! -s prettier-report.txt ]; then
+            echo "Prettier completed without console output." > prettier-report.txt
+          fi
+          echo "Prettier exit code: $prettier_exit_code"
+          exit 0
+
+      - name: Mark Prettier as skipped when no targets exist
+        if: steps.prettier_targets.outputs.has_targets != 'true'
+        run: echo "exit_code=0" >> "$GITHUB_OUTPUT"
+        id: prettier_skipped
+
+      - name: Publish code quality comment
+        if: always()
+        uses: actions/github-script@v7
+        env:
+          ESLINT_EXIT_CODE: ${{ steps.eslint_check.outputs.exit_code }}
+          PRETTIER_EXIT_CODE: ${{ steps.prettier_check.outputs.exit_code || steps.prettier_skipped.outputs.exit_code }}
+        with:
+          script: |
+            const fsQuality = require('fs');
+            const qualityMarker = '<!-- pr-automation-code-quality -->';
+            const eslintPassed = process.env.ESLINT_EXIT_CODE === '0';
+            const prettierPassed = process.env.PRETTIER_EXIT_CODE === '0';
+            const eslintOutput = fsQuality.existsSync('eslint-report.txt')
+              ? fsQuality.readFileSync('eslint-report.txt', 'utf8').trim()
+              : 'ESLint report not generated.';
+            const prettierOutput = fsQuality.existsSync('prettier-report.txt')
+              ? fsQuality.readFileSync('prettier-report.txt', 'utf8').trim()
+              : 'Prettier report not generated.';
+
+            const body = `${qualityMarker}
+            ## Code Quality Report
+            - **ESLint**: ${eslintPassed ? '✅ Passed' : '❌ Failed'}
+            - **Prettier**: ${prettierPassed ? '✅ Passed' : '❌ Failed'}
+            - **Overall status**: ${eslintPassed && prettierPassed ? '✅ Ready for review' : '⚠️ Requires attention'}
+
+            ### ESLint
+            \`\`\`
+            ${eslintOutput.slice(0, 60000)}
+            \`\`\`
+
+            ### Prettier
+            \`\`\`
+            ${prettierOutput.slice(0, 60000)}
+            \`\`\`
+            `;
+
+            const existingComments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              per_page: 100
+            });
+
+            const previousComment = existingComments.find((commentItem) =>
+              commentItem.user.type === 'Bot' && commentItem.body.includes(qualityMarker)
+            );
+
+            if (previousComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: previousComment.id,
+                body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body
+              });
+            }
+
+      - name: Fail when code quality checks fail
+        if: always()
+        run: |
+          eslint_exit_code="${{ steps.eslint_check.outputs.exit_code }}"
+          prettier_exit_code="${{ steps.prettier_check.outputs.exit_code || steps.prettier_skipped.outputs.exit_code }}"
+
+          if [ "$eslint_exit_code" -ne 0 ] || [ "$prettier_exit_code" -ne 0 ]; then
+            echo "One or more code quality checks failed."
+            exit 1
+          fi
+
+  testing-suite:
+    name: testing-suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run unit and integration tests
+        id: test_run
+        continue-on-error: true
+        run: |
+          set +e
+          npm test > test-output.txt 2>&1
+          test_exit_code=$?
+          echo "exit_code=$test_exit_code" >> "$GITHUB_OUTPUT"
+          if [ ! -s test-output.txt ]; then
+            echo "Test suite completed without console output." > test-output.txt
+          fi
+          echo "Test suite exit code: $test_exit_code"
+          exit 0
+
+      - name: Generate coverage report
+        id: coverage_run
+        continue-on-error: true
+        run: |
+          set +e
+          npm run test:coverage -- --coverageReporters=json-summary --coverageReporters=lcov --coverageReporters=text-summary > coverage-output.txt 2>&1
+          coverage_exit_code=$?
+          echo "exit_code=$coverage_exit_code" >> "$GITHUB_OUTPUT"
+          if [ ! -s coverage-output.txt ]; then
+            echo "Coverage run completed without console output." > coverage-output.txt
+          fi
+          echo "Coverage exit code: $coverage_exit_code"
+          exit 0
+
+      - name: Upload coverage artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-artifacts
+          path: |
+            coverage/
+            coverage-output.txt
+            test-output.txt
+          if-no-files-found: warn
+
+      - name: Publish test coverage comment
+        if: always()
+        uses: actions/github-script@v7
+        env:
+          TEST_EXIT_CODE: ${{ steps.test_run.outputs.exit_code }}
+          COVERAGE_EXIT_CODE: ${{ steps.coverage_run.outputs.exit_code }}
+        with:
+          script: |
+            const fsCoverage = require('fs');
+            const coverageMarker = '<!-- pr-automation-testing-suite -->';
+            const testPassed = process.env.TEST_EXIT_CODE === '0';
+            const coveragePassed = process.env.COVERAGE_EXIT_CODE === '0';
+            const testOutput = fsCoverage.existsSync('test-output.txt')
+              ? fsCoverage.readFileSync('test-output.txt', 'utf8').trim()
+              : 'Test output not generated.';
+            const coverageOutput = fsCoverage.existsSync('coverage-output.txt')
+              ? fsCoverage.readFileSync('coverage-output.txt', 'utf8').trim()
+              : 'Coverage output not generated.';
+
+            let coverageLines = 'Coverage summary not available.';
+            if (fsCoverage.existsSync('coverage/coverage-summary.json')) {
+              const summaryData = JSON.parse(fsCoverage.readFileSync('coverage/coverage-summary.json', 'utf8'));
+              const totalCoverage = summaryData.total || {};
+              const metrics = ['lines', 'statements', 'functions', 'branches']
+                .map((metricName) => {
+                  const metricData = totalCoverage[metricName];
+                  if (!metricData) {
+                    return null;
+                  }
+                  return `- **${metricName}**: ${metricData.pct}% (${metricData.covered}/${metricData.total})`;
+                })
+                .filter(Boolean);
+              if (metrics.length > 0) {
+                coverageLines = metrics.join('\n');
+              }
+            }
+
+            const body = `${coverageMarker}
+            ## Test Coverage Report
+            - **Test suite**: ${testPassed ? '✅ Passed' : '❌ Failed'}
+            - **Coverage generation**: ${coveragePassed ? '✅ Passed' : '❌ Failed'}
+            - **Artifacts**: Coverage reports uploaded for review.
+
+            ### Coverage summary
+            ${coverageLines}
+
+            ### Test output
+            \`\`\`
+            ${testOutput.slice(0, 40000)}
+            \`\`\`
+
+            ### Coverage output
+            \`\`\`
+            ${coverageOutput.slice(0, 40000)}
+            \`\`\`
+            `;
+
+            const existingComments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              per_page: 100
+            });
+
+            const previousComment = existingComments.find((commentItem) =>
+              commentItem.user.type === 'Bot' && commentItem.body.includes(coverageMarker)
+            );
+
+            if (previousComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: previousComment.id,
+                body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body
+              });
+            }
+
+      - name: Fail when tests or coverage fail
+        if: always()
+        run: |
+          test_exit_code="${{ steps.test_run.outputs.exit_code }}"
+          coverage_exit_code="${{ steps.coverage_run.outputs.exit_code }}"
+
+          if [ "$test_exit_code" -ne 0 ] || [ "$coverage_exit_code" -ne 0 ]; then
+            echo "The testing suite or coverage generation failed."
+            exit 1
+          fi
+
+  security-scan:
+    name: security-scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run dependency vulnerability checks
+        id: audit_run
+        continue-on-error: true
+        run: |
+          set +e
+          npm audit --json > audit-report.json 2> audit-errors.txt
+          audit_exit_code=$?
+          echo "exit_code=$audit_exit_code" >> "$GITHUB_OUTPUT"
+          if [ ! -s audit-report.json ]; then
+            echo '{}' > audit-report.json
+          fi
+          if [ ! -s audit-errors.txt ]; then
+            echo 'No npm audit stderr output.' > audit-errors.txt
+          fi
+          echo "Dependency audit exit code: $audit_exit_code"
+          exit 0
+
+      - name: Scan changed code for secrets
+        id: secrets_scan
+        continue-on-error: true
+        run: |
+          set +e
+          git diff --unified=0 "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}" -- . ':(exclude).github/workflows/*' > pr-changes.diff
+          grep -E '^\+[^+]' pr-changes.diff > added-lines.txt || true
+          grep -Ein '(AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}|gh[pousr]_[A-Za-z0-9]{36,}|xox[baprs]-[A-Za-z0-9-]{10,48}|-----BEGIN (RSA|DSA|EC|OPENSSH|PGP) PRIVATE KEY-----|((api[_-]?key|secret|token|password)[^[:alnum:]]{0,10}(=|:)))' added-lines.txt > secret-findings.txt
+          secret_exit_code=$?
+          if [ "$secret_exit_code" -eq 0 ]; then
+            echo "Potential secrets detected in pull request changes."
+            findings_count=$(wc -l < secret-findings.txt)
+          else
+            echo "No potential secrets detected in pull request changes." > secret-findings.txt
+            findings_count=0
+          fi
+          echo "exit_code=$secret_exit_code" >> "$GITHUB_OUTPUT"
+          echo "findings_count=$findings_count" >> "$GITHUB_OUTPUT"
+          echo "Secret scan exit code: $secret_exit_code"
+          exit 0
+
+      - name: Publish security scan comment
+        if: always()
+        uses: actions/github-script@v7
+        env:
+          AUDIT_EXIT_CODE: ${{ steps.audit_run.outputs.exit_code }}
+          SECRET_EXIT_CODE: ${{ steps.secrets_scan.outputs.exit_code }}
+          SECRET_FINDINGS_COUNT: ${{ steps.secrets_scan.outputs.findings_count }}
+        with:
+          script: |
+            const fsSecurity = require('fs');
+            const securityMarker = '<!-- pr-automation-security-scan -->';
+            const auditPassed = process.env.AUDIT_EXIT_CODE === '0';
+            const secretsPassed = process.env.SECRET_EXIT_CODE !== '0';
+            const auditErrors = fsSecurity.existsSync('audit-errors.txt')
+              ? fsSecurity.readFileSync('audit-errors.txt', 'utf8').trim()
+              : 'No npm audit stderr output.';
+            const secretFindings = fsSecurity.existsSync('secret-findings.txt')
+              ? fsSecurity.readFileSync('secret-findings.txt', 'utf8').trim()
+              : 'Secret findings report not generated.';
+
+            let vulnerabilitySummary = '- Vulnerability summary unavailable.';
+            let hasBlockingVulnerabilities = false;
+            if (fsSecurity.existsSync('audit-report.json')) {
+              try {
+                const auditData = JSON.parse(fsSecurity.readFileSync('audit-report.json', 'utf8'));
+                const vulnerabilityData = auditData.metadata && auditData.metadata.vulnerabilities
+                  ? auditData.metadata.vulnerabilities
+                  : null;
+                if (vulnerabilityData) {
+                  hasBlockingVulnerabilities = ['moderate', 'high', 'critical']
+                    .some((severity) => Number(vulnerabilityData[severity] || 0) > 0);
+                  vulnerabilitySummary = [
+                    `- **Dependencies checked**: ${auditData.metadata.dependencies?.total ?? 'unknown'}`,
+                    `- **Vulnerabilities**: info=${vulnerabilityData.info}, low=${vulnerabilityData.low}, moderate=${vulnerabilityData.moderate}, high=${vulnerabilityData.high}, critical=${vulnerabilityData.critical}`
+                  ].join('\n');
+                }
+              } catch (parseError) {
+                vulnerabilitySummary = `- Vulnerability summary unavailable: ${parseError.message}`;
+              }
+            }
+
+            const body = `${securityMarker}
+            ## Security Scan Report
+            - **Dependencies**: ${auditPassed && !hasBlockingVulnerabilities ? '✅ No blocking issues detected' : '⚠️ Vulnerabilities or audit warnings detected'}
+            - **Secret scan**: ${secretsPassed ? '✅ No potential secrets detected' : '❌ Potential secrets detected'}
+            - **Potential secret findings**: ${process.env.SECRET_FINDINGS_COUNT || '0'}
+
+            ### Vulnerabilities
+            ${vulnerabilitySummary}
+
+            ### npm audit diagnostics
+            \`\`\`
+            ${auditErrors.slice(0, 30000)}
+            \`\`\`
+
+            ### Secret scan findings
+            \`\`\`
+            ${secretFindings.slice(0, 30000)}
+            \`\`\`
+            `;
+
+            const existingComments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              per_page: 100
+            });
+
+            const previousComment = existingComments.find((commentItem) =>
+              commentItem.user.type === 'Bot' && commentItem.body.includes(securityMarker)
+            );
+
+            if (previousComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: previousComment.id,
+                body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body
+              });
+            }
+
+      - name: Fail when secrets are detected or audit execution breaks
+        if: always()
+        run: |
+          audit_exit_code="${{ steps.audit_run.outputs.exit_code }}"
+          secret_exit_code="${{ steps.secrets_scan.outputs.exit_code }}"
+
+          if [ "$secret_exit_code" -eq 0 ]; then
+            echo "Security scan detected potential secrets."
+            exit 1
+          fi
+
+          if [ "$audit_exit_code" -gt 1 ]; then
+            echo "npm audit encountered an execution error."
+            exit 1
+          fi
+
+  build-validation:
+    name: build-validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build application
+        id: build_run
+        continue-on-error: true
+        run: |
+          set +e
+          npm run build > build-output.txt 2>&1
+          build_exit_code=$?
+          echo "exit_code=$build_exit_code" >> "$GITHUB_OUTPUT"
+          if [ ! -s build-output.txt ]; then
+            echo "Build completed without console output." > build-output.txt
+          fi
+          echo "Build exit code: $build_exit_code"
+          exit 0
+
+      - name: Start application for endpoint validation
+        id: start_server
+        continue-on-error: true
+        run: |
+          set +e
+          mkdir -p preview-artifacts
+          NODE_ENV=production PORT=3000 nohup npm start > preview-artifacts/server.log 2>&1 &
+          server_pid=$!
+          echo "$server_pid" > server.pid
+          echo "pid=$server_pid" >> "$GITHUB_OUTPUT"
+
+          server_ready=false
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:3000/health > /dev/null; then
+              server_ready=true
+              break
+            fi
+            sleep 2
+          done
+
+          echo "ready=$server_ready" >> "$GITHUB_OUTPUT"
+          echo "Server ready: $server_ready"
+          exit 0
+
+      - name: Validate endpoints and create preview artifacts
+        id: endpoint_validation
+        continue-on-error: true
+        env:
+          SERVER_READY: ${{ steps.start_server.outputs.ready }}
+        run: |
+          node <<'NODE'
+          const fs = require('fs');
+          const path = require('path');
+
+          const previewDir = path.join(process.cwd(), 'preview-artifacts');
+          fs.mkdirSync(previewDir, { recursive: true });
+
+          const serverReady = process.env.SERVER_READY === 'true';
+          const resultPath = path.join(previewDir, 'endpoint-validation.json');
+          const summaryPath = path.join(previewDir, 'endpoint-summary.md');
+
+          if (!serverReady) {
+            const notReadySummary = [
+              '# Endpoint Validation Summary',
+              '',
+              '- Server startup: failed',
+              '- Endpoint validation: skipped because the application did not become reachable in time.'
+            ].join('\n');
+            fs.writeFileSync(resultPath, JSON.stringify({ serverReady, results: [] }, null, 2));
+            fs.writeFileSync(summaryPath, notReadySummary);
+            process.exit(1);
+          }
+
+          const endpointChecks = [
+            {
+              name: 'GET /',
+              url: 'http://127.0.0.1:3000/',
+              method: 'GET',
+              expectedStatus: 200
+            },
+            {
+              name: 'GET /health',
+              url: 'http://127.0.0.1:3000/health',
+              method: 'GET',
+              expectedStatus: 200
+            },
+            {
+              name: 'GET /users',
+              url: 'http://127.0.0.1:3000/users',
+              method: 'GET',
+              expectedStatus: 200
+            },
+            {
+              name: 'POST /calculate',
+              url: 'http://127.0.0.1:3000/calculate',
+              method: 'POST',
+              expectedStatus: 200,
+              body: { operation: 'add', a: 2, b: 3 }
+            },
+            {
+              name: 'POST /users',
+              url: 'http://127.0.0.1:3000/users',
+              method: 'POST',
+              expectedStatus: 201,
+              body: { name: 'Workflow Bot', email: 'workflow.bot@example.com' }
+            },
+            {
+              name: 'GET /status/deployment',
+              url: 'http://127.0.0.1:3000/status/deployment',
+              method: 'GET',
+              expectedStatus: 200
+            }
+          ];
+
+          const endpointResults = [];
+          let hasFailures = false;
+
+          async function runChecks() {
+            for (const endpointCheck of endpointChecks) {
+              const requestOptions = {
+                method: endpointCheck.method,
+                headers: {
+                  Accept: 'application/json'
+                }
+              };
+
+              if (endpointCheck.body) {
+                requestOptions.headers['Content-Type'] = 'application/json';
+                requestOptions.body = JSON.stringify(endpointCheck.body);
+              }
+
+              try {
+                const response = await fetch(endpointCheck.url, requestOptions);
+                const responseText = await response.text();
+                const endpointPassed = response.status === endpointCheck.expectedStatus;
+                hasFailures = hasFailures || !endpointPassed;
+
+                endpointResults.push({
+                  name: endpointCheck.name,
+                  method: endpointCheck.method,
+                  url: endpointCheck.url,
+                  expectedStatus: endpointCheck.expectedStatus,
+                  actualStatus: response.status,
+                  passed: endpointPassed,
+                  responsePreview: responseText.slice(0, 500)
+                });
+              } catch (validationError) {
+                hasFailures = true;
+                endpointResults.push({
+                  name: endpointCheck.name,
+                  method: endpointCheck.method,
+                  url: endpointCheck.url,
+                  expectedStatus: endpointCheck.expectedStatus,
+                  actualStatus: 'REQUEST_FAILED',
+                  passed: false,
+                  responsePreview: validationError.message
+                });
+              }
+            }
+
+            const markdownSummary = [
+              '# Endpoint Validation Summary',
+              '',
+              ...endpointResults.map((endpointResult) =>
+                `- ${endpointResult.passed ? '✅' : '❌'} ${endpointResult.name} -> expected ${endpointResult.expectedStatus}, received ${endpointResult.actualStatus}`
+              )
+            ].join('\n');
+
+            fs.writeFileSync(resultPath, JSON.stringify({ serverReady, results: endpointResults }, null, 2));
+            fs.writeFileSync(summaryPath, markdownSummary);
+
+            if (hasFailures) {
+              process.exit(1);
+            }
+          }
+
+          runChecks().catch((fatalError) => {
+            fs.writeFileSync(
+              summaryPath,
+              ['# Endpoint Validation Summary', '', `- Validation failed before completion: ${fatalError.message}`].join('\n')
+            );
+            process.exit(1);
+          });
+          NODE
+
+      - name: Upload deployment preview artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-preview-artifacts
+          path: |
+            preview-artifacts/
+            build-output.txt
+          if-no-files-found: warn
+
+      - name: Publish build validation comment
+        if: always()
+        uses: actions/github-script@v7
+        env:
+          BUILD_EXIT_CODE: ${{ steps.build_run.outputs.exit_code }}
+          SERVER_READY: ${{ steps.start_server.outputs.ready }}
+          ENDPOINT_VALIDATION_EXIT_CODE: ${{ steps.endpoint_validation.outcome == 'success' && '0' || '1' }}
+        with:
+          script: |
+            const fsBuild = require('fs');
+            const buildMarker = '<!-- pr-automation-build-validation -->';
+            const buildPassed = process.env.BUILD_EXIT_CODE === '0';
+            const serverReady = process.env.SERVER_READY === 'true';
+            const endpointValidationPassed = process.env.ENDPOINT_VALIDATION_EXIT_CODE === '0';
+            const buildOutput = fsBuild.existsSync('build-output.txt')
+              ? fsBuild.readFileSync('build-output.txt', 'utf8').trim()
+              : 'Build output not generated.';
+            const endpointSummary = fsBuild.existsSync('preview-artifacts/endpoint-summary.md')
+              ? fsBuild.readFileSync('preview-artifacts/endpoint-summary.md', 'utf8').trim()
+              : 'Endpoint validation summary not generated.';
+
+            const body = `${buildMarker}
+            ## Build Validation
+            - **Build step**: ${buildPassed ? '✅ Passed' : '❌ Failed'}
+            - **Server startup**: ${serverReady ? '✅ Reachable' : '❌ Not reachable'}
+            - **Endpoint validation**: ${endpointValidationPassed ? '✅ Passed' : '❌ Failed'}
+            - **Preview artifacts**: Deployment preview artifacts uploaded for this pull request.
+
+            ### Build output
+            \`\`\`
+            ${buildOutput.slice(0, 30000)}
+            \`\`\`
+
+            ### Endpoint validation summary
+            ${endpointSummary}
+            `;
+
+            const existingComments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              per_page: 100
+            });
+
+            const previousComment = existingComments.find((commentItem) =>
+              commentItem.user.type === 'Bot' && commentItem.body.includes(buildMarker)
+            );
+
+            if (previousComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: previousComment.id,
+                body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body
+              });
+            }
+
+      - name: Stop application server
+        if: always()
+        run: |
+          if [ -f server.pid ]; then
+            server_pid=$(cat server.pid)
+            if kill -0 "$server_pid" 2>/dev/null; then
+              kill "$server_pid"
+            fi
+          fi
+
+      - name: Fail when build validation fails
+        if: always()
+        run: |
+          build_exit_code="${{ steps.build_run.outputs.exit_code }}"
+          server_ready="${{ steps.start_server.outputs.ready }}"
+          endpoint_validation_outcome="${{ steps.endpoint_validation.outcome }}"
+
+          if [ "$build_exit_code" -ne 0 ] || [ "$server_ready" != 'true' ] || [ "$endpoint_validation_outcome" != 'success' ]; then
+            echo "Build validation failed."
+            exit 1
+          fi
